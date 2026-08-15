@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Emploi du temps - Collège</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<meta name="theme-color" content="#23324D" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" />
+
+<style>
+  body { margin: 0; }
+  .spin-icon { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="loading-fallback" style="min-height:100vh; display:flex; align-items:center; justify-content:center; font-family: sans-serif; color:#5B6B85; text-align:center; padding:24px; box-sizing:border-box;">
+    Chargement de l'application…
+  </div>
+</div>
+
+<script>
+  // Stockage local du navigateur a la place du stockage propre a Claude,
+  // pour que l'application fonctionne une fois hebergee ailleurs.
+  window.storage = {
+    async get(key, shared) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw === null) return null;
+        return { key, value: raw, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async set(key, value, shared) {
+      try {
+        localStorage.setItem(key, value);
+        return { key, value, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async delete(key, shared) {
+      try {
+        localStorage.removeItem(key);
+        return { key, deleted: true, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async list(prefix, shared) {
+      try {
+        const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+        return { keys, prefix, shared: !!shared };
+      } catch (e) { return null; }
+    },
+  };
+</script>
+
+<!-- Le code de l'appli est mis en "text/plain" : le navigateur ne l'execute
+     pas tout seul. On le transforme et on l'execute nous-memes juste apres,
+     ce qui permet d'afficher une erreur precise en cas de probleme. -->
+<script id="app-source" type="text/plain">
+const { useState, useEffect, useRef } = React;
+
+
+// Charge un script externe une seule fois (mis en cache sur window) et résout
+// quand il est prêt à être utilisé.
+function loadScript(src, globalCheck) {
+  return new Promise((resolve, reject) => {
+    if (globalCheck()) { resolve(); return; }
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error("load failed")));
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("load failed"));
+    document.head.appendChild(script);
+  });
+}
+
+async function ensurePdfLibsLoaded() {
+  await loadScript(
+    "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js",
+    () => !!window.html2canvas
+  );
+  await loadScript(
+    "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
+    () => !!(window.jspdf && window.jspdf.jsPDF)
+  );
+}
+
+const SWATCHES = [
+  "#8FC7E8", "#FFD966", "#8FD3A0", "#F5A6C0",
+  "#D9A6F0", "#F2B57A", "#E8A66C", "#9FB8E0",
+];
+
+const DEFAULT_SUBJECTS = [
+  { id: "math", name: "Mathématiques", color: "#8FC7E8" },
+  { id: "fr", name: "Français", color: "#FFD966" },
+  { id: "hist", name: "Histoire-Géo", color: "#F2B57A" },
+  { id: "ang", name: "Anglais", color: "#F5A6C0" },
+  { id: "svt", name: "SVT", color: "#8FD3A0" },
+  { id: "eps", name: "EPS", color: "#D9A6F0" },
+];
+
+// Tous les créneaux d'une heure, de 7h à 19h : on choisit ensuite 1h, 2h ou 3h
+// en fusionnant des créneaux consécutifs.
+const DEFAULT_SLOTS = [
+  { id: "s7", label: "07h – 08h" },
+  { id: "s8", label: "08h – 09h" },
+  { id: "s9", label: "09h – 10h" },
+  { id: "s10", label: "10h – 11h" },
+  { id: "s11", label: "11h – 12h" },
+  { id: "s12", label: "12h – 13h" },
+  { id: "s13", label: "13h – 14h" },
+  { id: "s14", label: "14h – 15h" },
+  { id: "s15", label: "15h – 16h" },
+  { id: "s16", label: "16h – 17h" },
+  { id: "s17", label: "17h – 18h" },
+  { id: "s18", label: "18h – 19h" },
+];
+
+const DEFAULT_DAYS = [
+  { id: "lun", name: "Lundi", active: true },
+  { id: "mar", name: "Mardi", active: true },
+  { id: "mer", name: "Mercredi", active: true },
+  { id: "jeu", name: "Jeudi", active: true },
+  { id: "ven", name: "Vendredi", active: true },
+  { id: "sam", name: "Samedi", active: false },
+];
+
+const DEFAULT_ESTABLISHMENTS = [{ id: "e1", name: "", year: "", footerLabel: "Le censorat" }];
+const DEFAULT_CLASSES = [{ id: "c1", name: "6ème A", estId: "e1" }];
+
+const STORAGE_KEY = "emploi-du-temps-college-state";
+
+function uid(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function startHour(label) {
+  const match = label.match(/(\d{1,2})/);
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+function sortSlots(slots) {
+  return [...slots].sort((a, b) => startHour(a.label) - startHour(b.label));
+}
+
+// Découpe les créneaux d'un jour en blocs "start" (début d'un cours, éventuellement
+// fusionné sur plusieurs heures), "skip" (heure couverte par un cours qui a commencé
+// avant) ou "empty" (rien de prévu). Utilisé pour la grille interactive à l'écran.
+function buildDayCells(dayId, timeSlots, daySchedule) {
+  const cells = [];
+  let skipUntil = -1;
+  timeSlots.forEach((slot, idx) => {
+    if (idx <= skipUntil) {
+      cells.push({ kind: "skip" });
+      return;
+    }
+    const key = `${dayId}__${slot.id}`;
+    const block = daySchedule[key];
+    if (block && block.subjectId) {
+      const duration = Math.max(1, Math.min(block.duration || 1, timeSlots.length - idx));
+      skipUntil = idx + duration - 1;
+      cells.push({ kind: "start", subjectId: block.subjectId, duration, slotId: slot.id });
+    } else {
+      cells.push({ kind: "empty", slotId: slot.id });
+    }
+  });
+  return cells;
+}
+
+function blockLabel(timeSlots, startIdx, duration) {
+  const first = timeSlots[startIdx];
+  const last = timeSlots[Math.min(startIdx + duration - 1, timeSlots.length - 1)];
+  const start = first.label.split("–")[0].trim();
+  const end = last.label.split("–")[1] ? last.label.split("–")[1].trim() : last.label.trim();
+  return `${start} – ${end}`;
+}
+
+function compactLabel(label) {
+  return label.replace(/\s*–\s*/, "-").replace(/\s+/g, "");
+}
+
+// Les colonnes imprimées excluent la pause de midi (13h-14h et 14h-15h),
+// comme sur le formulaire officiel.
+function getPrintSlots(timeSlots) {
+  return timeSlots.filter((s) => ![13, 14].includes(startHour(s.label)));
+}
+
+function getFullIndex(timeSlots, slotId) {
+  return timeSlots.findIndex((s) => s.id === slotId);
+}
+
+// Construit, pour un jour donné, la liste des cellules à afficher dans les
+// colonnes horaires imprimées (avec fusion horizontale via colSpan quand un
+// cours occupe plusieurs heures consécutives).
+function buildPrintRow(dayId, timeSlots, printSlots, daySchedule) {
+  const cells = [];
+  let skipCount = 0;
+  for (let i = 0; i < printSlots.length; i++) {
+    if (skipCount > 0) {
+      skipCount--;
+      continue;
+    }
+    const slot = printSlots[i];
+    const key = `${dayId}__${slot.id}`;
+    const block = daySchedule[key];
+    if (block && block.subjectId) {
+      const fullIdx = getFullIndex(timeSlots, slot.id);
+      const duration = block.duration || 1;
+      const endFullIdx = fullIdx + duration - 1;
+      let span = 1;
+      let j = i + 1;
+      while (j < printSlots.length && getFullIndex(timeSlots, printSlots[j].id) <= endFullIdx) {
+        span++;
+        j++;
+      }
+      skipCount = span - 1;
+      cells.push({ kind: "start", subjectId: block.subjectId, span });
+    } else {
+      cells.push({ kind: "empty" });
+    }
+  }
+  return cells;
+}
+
+function renderPrintGrid(cls, subjects, timeSlots, activeDays, schedules) {
+  const daySchedule = schedules[cls.id] || {};
+  const printSlots = getPrintSlots(timeSlots);
+  return (
+    <table className="print-table">
+      <thead>
+        <tr>
+          <th className="print-corner">
+            <span className="print-corner-heures">Heures</span>
+            <span className="print-corner-jours">Jours</span>
+          </th>
+          {printSlots.map((s) => (
+            <th key={s.id}>{compactLabel(s.label)}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {activeDays.map((d) => {
+          const rowCells = buildPrintRow(d.id, timeSlots, printSlots, daySchedule);
+          return (
+            <tr key={d.id}>
+              <td className="print-day-label">{d.name}</td>
+              {rowCells.map((cell, idx) => {
+                if (cell.kind === "empty") return <td key={idx}></td>;
+                const subj = subjects.find((s) => s.id === cell.subjectId);
+                return (
+                  <td key={idx} colSpan={cell.span} style={{ background: subj ? subj.color + "55" : undefined }}>
+                    {subj ? subj.name : ""}
+                  </td>
+                );
+              })}
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function TimetableApp() {
+  const [subjects, setSubjects] = useState(DEFAULT_SUBJECTS);
+  const [timeSlots, setTimeSlots] = useState(() => sortSlots(DEFAULT_SLOTS));
+  const [days, setDays] = useState(DEFAULT_DAYS);
+  const [establishments, setEstablishments] = useState(DEFAULT_ESTABLISHMENTS);
+  const [activeEstablishmentId, setActiveEstablishmentId] = useState("e1");
+  const [classes, setClasses] = useState(DEFAULT_CLASSES);
+  const [activeClassId, setActiveClassId] = useState("c1");
+  const [schedules, setSchedules] = useState({});
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("idle");
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [printOpen, setPrintOpen] = useState(false);
+  const [printSelected, setPrintSelected] = useState(["c1"]);
+  const [pdfGenerating, setPdfGenerating] = useState(false);
+  const [pdfError, setPdfError] = useState(null);
+  const [newEstablishmentName, setNewEstablishmentName] = useState("");
+  const [newClassName, setNewClassName] = useState("");
+  const [newSubjectName, setNewSubjectName] = useState("");
+  const [newSubjectColor, setNewSubjectColor] = useState(SWATCHES[0]);
+  const [newSlotStart, setNewSlotStart] = useState("");
+  const [newSlotEnd, setNewSlotEnd] = useState("");
+
+  const saveTimer = useRef(null);
+  const firstLoad = useRef(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          if (data.subjects) setSubjects(data.subjects);
+          if (data.timeSlots) setTimeSlots(sortSlots(data.timeSlots));
+          if (data.days) setDays(data.days);
+
+          // Rétrocompatibilité : les sauvegardes plus anciennes n'avaient pas
+          // encore la notion d'établissement.
+          let loadedEstablishments = data.establishments;
+          if (!loadedEstablishments || loadedEstablishments.length === 0) {
+            loadedEstablishments = [
+              { id: "e1", name: data.schoolName || "", year: data.schoolYear || "", footerLabel: "Le censorat" },
+            ];
+          }
+          setEstablishments(loadedEstablishments);
+          const estId = data.activeEstablishmentId || loadedEstablishments[0].id;
+          setActiveEstablishmentId(estId);
+
+          let loadedClasses = data.classes || DEFAULT_CLASSES;
+          loadedClasses = loadedClasses.map((c) => (c.estId ? c : { ...c, estId: loadedEstablishments[0].id }));
+          setClasses(loadedClasses);
+
+          if (data.activeClassId) setActiveClassId(data.activeClassId);
+          if (data.schedules) setSchedules(data.schedules);
+          if (data.printSelected) setPrintSelected(data.printSelected);
+        }
+      } catch (e) {
+        // Pas encore de données sauvegardées, on démarre avec les valeurs par défaut
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (firstLoad.current) {
+      firstLoad.current = false;
+      return;
+    }
+    setSaveStatus("saving");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set(
+          STORAGE_KEY,
+          JSON.stringify({
+            subjects, timeSlots, days, establishments, activeEstablishmentId,
+            classes, activeClassId, schedules, printSelected,
+          }),
+          false
+        );
+        setSaveStatus("saved");
+      } catch (e) {
+        setSaveStatus("idle");
+      }
+    }, 600);
+    return () => clearTimeout(saveTimer.current);
+  }, [subjects, timeSlots, days, establishments, activeEstablishmentId, classes, activeClassId, schedules, printSelected, loaded]);
+
+  const establishmentClasses = classes.filter((c) => c.estId === activeEstablishmentId);
+  const activeClass = establishmentClasses.find((c) => c.id === activeClassId) || establishmentClasses[0];
+  const activeSchedule = (activeClass && schedules[activeClass.id]) || {};
+  const activeDays = days.filter((d) => d.active);
+  const activeEstablishment =
+    establishments.find((e) => e.id === activeEstablishmentId) || { name: "", year: "", footerLabel: "Le censorat" };
+
+  const dayCellsMap = {};
+  activeDays.forEach((d) => {
+    dayCellsMap[d.id] = buildDayCells(d.id, timeSlots, activeSchedule);
+  });
+
+  function setCellBlock(dayId, slotId, subjectId, duration) {
+    if (!activeClass) return;
+    const idx = timeSlots.findIndex((s) => s.id === slotId);
+    if (idx === -1) return;
+    setSchedules((prev) => {
+      const classSchedule = { ...(prev[activeClass.id] || {}) };
+      const key = `${dayId}__${slotId}`;
+      if (!subjectId) {
+        delete classSchedule[key];
+        return { ...prev, [activeClass.id]: classSchedule };
+      }
+      const maxDur = timeSlots.length - idx;
+      const dur = Math.max(1, Math.min(duration || 1, maxDur));
+      const newStart = idx;
+      const newEnd = idx + dur - 1;
+      Object.keys(classSchedule).forEach((k) => {
+        if (!k.startsWith(`${dayId}__`)) return;
+        if (k === key) return;
+        const otherSlotId = k.split("__")[1];
+        const otherIdx = timeSlots.findIndex((s) => s.id === otherSlotId);
+        if (otherIdx === -1) return;
+        const otherDur = classSchedule[k].duration || 1;
+        const otherStart = otherIdx;
+        const otherEnd = otherIdx + otherDur - 1;
+        if (otherStart <= newEnd && otherEnd >= newStart) delete classSchedule[k];
+      });
+      classSchedule[key] = { subjectId, duration: dur };
+      return { ...prev, [activeClass.id]: classSchedule };
+    });
+  }
+
+  function addEstablishment() {
+    const name = newEstablishmentName.trim();
+    const id = uid("est");
+    const classId = uid("cls");
+    setEstablishments((prev) => [...prev, { id, name, year: "", footerLabel: "Le censorat" }]);
+    setClasses((prev) => [...prev, { id: classId, name: "6ème A", estId: id }]);
+    setActiveEstablishmentId(id);
+    setActiveClassId(classId);
+    setNewEstablishmentName("");
+  }
+
+  function removeEstablishment(id) {
+    const nextEstablishments = establishments.filter((e) => e.id !== id);
+    const removedClassIds = classes.filter((c) => c.estId === id).map((c) => c.id);
+    const nextClasses = classes.filter((c) => c.estId !== id);
+    setEstablishments(nextEstablishments);
+    setClasses(nextClasses);
+    setSchedules((prev) => {
+      const next = { ...prev };
+      removedClassIds.forEach((cid) => delete next[cid]);
+      return next;
+    });
+    setPrintSelected((prev) => prev.filter((cid) => !removedClassIds.includes(cid)));
+    if (activeEstablishmentId === id) {
+      const fallbackEst = nextEstablishments[0];
+      const fallbackId = fallbackEst ? fallbackEst.id : "";
+      setActiveEstablishmentId(fallbackId);
+      const fallbackClasses = nextClasses.filter((c) => c.estId === fallbackId);
+      setActiveClassId(fallbackClasses[0] ? fallbackClasses[0].id : "");
+    }
+  }
+
+  function updateActiveEstablishment(field, value) {
+    setEstablishments((prev) => prev.map((e) => (e.id === activeEstablishmentId ? { ...e, [field]: value } : e)));
+  }
+
+  function selectEstablishment(id) {
+    setActiveEstablishmentId(id);
+    const cls = classes.filter((c) => c.estId === id)[0];
+    setActiveClassId(cls ? cls.id : "");
+  }
+
+  function addClass() {
+    const name = newClassName.trim();
+    if (!name || !activeEstablishmentId) return;
+    const id = uid("cls");
+    setClasses((prev) => [...prev, { id, name, estId: activeEstablishmentId }]);
+    setActiveClassId(id);
+    setNewClassName("");
+  }
+
+  function removeClass(id) {
+    setClasses((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      if (activeClassId === id) {
+        const fallback = next.filter((c) => c.estId === activeEstablishmentId)[0];
+        setActiveClassId(fallback ? fallback.id : "");
+      }
+      return next;
+    });
+    setSchedules((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setPrintSelected((prev) => prev.filter((cid) => cid !== id));
+  }
+
+  function addSubject() {
+    const name = newSubjectName.trim();
+    if (!name) return;
+    setSubjects((prev) => [...prev, { id: uid("subj"), name, color: newSubjectColor }]);
+    setNewSubjectName("");
+  }
+
+  function removeSubject(id) {
+    setSubjects((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  function addSlot() {
+    if (!newSlotStart.trim() || !newSlotEnd.trim()) return;
+    setTimeSlots((prev) =>
+      sortSlots([...prev, { id: uid("slot"), label: `${newSlotStart.trim()} – ${newSlotEnd.trim()}` }])
+    );
+    setNewSlotStart("");
+    setNewSlotEnd("");
+  }
+
+  function removeSlot(id) {
+    setTimeSlots((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  function toggleDay(id) {
+    setDays((prev) => prev.map((d) => (d.id === id ? { ...d, active: !d.active } : d)));
+  }
+
+  function togglePrintClass(id) {
+    setPrintSelected((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
+  }
+
+  function launchPrint() {
+    window.print();
+  }
+
+  async function downloadPdf() {
+    if (printSelected.length === 0) return;
+    setPdfError(null);
+    setPdfGenerating(true);
+    try {
+      await ensurePdfLibsLoaded();
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape" });
+      for (let i = 0; i < printSelected.length; i++) {
+        const id = printSelected[i];
+        const node = document.getElementById(`print-page-${id}`);
+        if (!node) continue;
+        const canvas = await window.html2canvas(node, { scale: 2, backgroundColor: "#ffffff" });
+        const imgData = canvas.toDataURL("image/png");
+        if (i > 0) doc.addPage();
+        doc.addImage(imgData, "PNG", 0, 0, 297, 210);
+      }
+      doc.save("emploi-du-temps.pdf");
+    } catch (e) {
+      setPdfError("Le téléchargement a échoué. Vérifiez votre connexion et réessayez.");
+    } finally {
+      setPdfGenerating(false);
+    }
+  }
+
+  // Rendu d'une copie imprimable complète (en-tête établissement + tableau +
+  // signature en bas de page) pour une classe donnée.
+  function renderPrintCopy(cls, est) {
+    return (
+      <div className="print-copy">
+        <div className="print-copy-header">
+          {est.name && <div className="print-header-school">{est.name}</div>}
+          <div className="print-header-title">
+            Emploi du temps{est.year ? ` — Année scolaire ${est.year}` : ""}
+          </div>
+          <div className="print-header-class">Classe : {cls.name}</div>
+        </div>
+        {renderPrintGrid(cls, subjects, timeSlots, activeDays, schedules)}
+        <div className="print-footer">
+          <div className="print-signature">
+            <div className="print-signature-line">&nbsp;</div>
+            <div className="print-signature-label">{est.footerLabel || "Le censorat"}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <div style={{ background: "#F7F7F2" }} className="min-h-screen flex items-center justify-center">
+        <p style={{ color: "#5B6B85", fontFamily: "'Inter', sans-serif" }}>Chargement du cahier…</p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: "#F7F7F2" }} className="min-h-screen font-body">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        .font-display { font-family: 'Kalam', cursive; }
+        .font-body { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'IBM Plex Mono', monospace; }
+        select.cell-select:focus-visible, button:focus-visible, input:focus-visible {
+          outline: 2px solid #23324D;
+          outline-offset: 1px;
+        }
+        .print-only {
+          position: absolute;
+          top: 0;
+          left: -10000px;
+          width: 297mm;
+          background: #fff;
+        }
+        .print-page {
+          width: 297mm;
+          min-height: 210mm;
+          padding: 10mm;
+          box-sizing: border-box;
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+          background: #fff;
+        }
+        .print-copy { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+        .print-copy-header { margin-bottom: 4px; flex: none; }
+        .print-header-school { font-family: 'Kalam', cursive; font-size: 18px; color: #23324D; }
+        .print-header-title { font-family: 'Kalam', cursive; font-size: 20px; color: #23324D; }
+        .print-header-class { font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600; color: #5B6B85; margin-top: 1px; }
+        .print-cut-line {
+          flex: none;
+          border-top: 1px dashed #9AA7BD;
+          margin: 6mm 0;
+          text-align: center;
+          color: #9AA7BD;
+          font-size: 9px;
+          position: relative;
+        }
+        .print-cut-line span {
+          position: absolute;
+          top: -8px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: #fff;
+          padding: 0 6px;
+          font-family: 'Inter', sans-serif;
+        }
+        .print-table { width: 100%; border-collapse: collapse; font-family: 'Inter', sans-serif; font-size: 11px; table-layout: fixed; }
+        .print-table th, .print-table td { border: 1px solid #9AA7BD; padding: 5px 4px; text-align: center; }
+        .print-table th { font-family: 'Kalam', cursive; font-weight: 400; font-size: 13px; color: #23324D; }
+        .print-day-label { font-family: 'Kalam', cursive; font-size: 13px; color: #23324D; text-align: left !important; padding-left: 8px !important; width: 80px; }
+        .print-corner {
+          position: relative;
+          width: 80px;
+          background: linear-gradient(to top left, transparent calc(50% - 0.5px), #9AA7BD, transparent calc(50% + 0.5px));
+        }
+        .print-corner-heures { position: absolute; top: 3px; right: 6px; font-size: 10px; }
+        .print-corner-jours { position: absolute; bottom: 3px; left: 6px; font-size: 10px; }
+        .print-footer { margin-top: auto; padding-top: 8mm; display: flex; justify-content: flex-end; flex: none; }
+        .print-signature { text-align: center; width: 55mm; }
+        .print-signature-line { border-top: 1px solid #23324D; margin-bottom: 4px; }
+        .print-signature-label { font-family: 'Kalam', cursive; font-size: 13px; color: #23324D; }
+        @page { size: A4 landscape; margin: 0; }
+        @media print {
+          .screen-only { display: none !important; }
+          .print-only { position: static !important; left: 0; top: 0; width: auto; }
+          .print-page { page-break-after: always; }
+          .print-page:last-child { page-break-after: auto; }
+        }
+      `}</style>
+
+      <div className="screen-only">
+        <div className="max-w-6xl mx-auto px-4 sm:px-8 py-8">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 mb-6 flex-wrap">
+            <div className="relative pl-5">
+              <div
+                className="absolute left-0 top-0 bottom-0 w-[3px] rounded-full"
+                style={{ background: "#B94A3F" }}
+              />
+              <h1 className="font-display text-4xl sm:text-5xl" style={{ color: "#23324D" }}>
+                Emploi du temps
+              </h1>
+              {(activeEstablishment.name || activeEstablishment.year) && (
+                <p className="text-sm font-medium mt-0.5" style={{ color: "#23324D" }}>
+                  {activeEstablishment.name}
+                  {activeEstablishment.name && activeEstablishment.year ? " — " : ""}
+                  {activeEstablishment.year ? `Année scolaire ${activeEstablishment.year}` : ""}
+                </p>
+              )}
+              <p className="text-sm mt-1" style={{ color: "#5B6B85" }}>
+                Choisissez un jour, un créneau (1h, 2h ou 3h), et la matière à y placer.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-xs font-mono" style={{ color: "#9AA7BD" }}>
+                {saveStatus === "saving" ? "Enregistrement…" : saveStatus === "saved" ? "Enregistré" : ""}
+              </span>
+              <button
+                onClick={() => { setPrintOpen((v) => !v); setPanelOpen(false); }}
+                className="flex items-center gap-1.5 text-sm font-medium px-3 py-2 rounded-lg transition"
+                style={{
+                  background: printOpen ? "#23324D" : "#FFFFFF",
+                  color: printOpen ? "#FFFFFF" : "#23324D",
+                  border: "1px solid #C9D6E3",
+                }}
+              >
+                <span style={{ fontSize: 15 }}>🖨</span>
+                Imprimer
+              </button>
+              <button
+                onClick={() => { setPanelOpen((v) => !v); setPrintOpen(false); }}
+                className="flex items-center gap-1.5 text-sm font-medium px-3 py-2 rounded-lg transition"
+                style={{
+                  background: panelOpen ? "#23324D" : "#FFFFFF",
+                  color: panelOpen ? "#FFFFFF" : "#23324D",
+                  border: "1px solid #C9D6E3",
+                }}
+              >
+                <span style={{ fontSize: 15 }}>⚙</span>
+                Réglages
+              </button>
+            </div>
+          </div>
+
+          {/* Print panel */}
+          {printOpen && (
+            <div className="mb-6 rounded-xl p-5" style={{ background: "#FFFFFF", border: "1px solid #C9D6E3" }}>
+              <h3 className="font-display text-lg mb-1" style={{ color: "#23324D" }}>Imprimer les emplois du temps</h3>
+              <p className="text-xs mb-3" style={{ color: "#5B6B85" }}>
+                Classes de « {activeEstablishment.name || "cet établissement"} ». Chaque classe sélectionnée sort sur sa propre page, en deux copies (à découper).
+              </p>
+              <div className="flex flex-col gap-1.5 mb-4">
+                {establishmentClasses.map((c) => (
+                  <label key={c.id} className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: "#23324D" }}>
+                    <input
+                      type="checkbox"
+                      checked={printSelected.includes(c.id)}
+                      onChange={() => togglePrintClass(c.id)}
+                    />
+                    {c.name}
+                  </label>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={launchPrint}
+                  disabled={printSelected.length === 0}
+                  className="flex items-center gap-1.5 text-sm font-medium px-4 py-2 rounded-lg transition disabled:opacity-40"
+                  style={{ background: "#23324D", color: "#FFFFFF" }}
+                >
+                  <span style={{ fontSize: 15 }}>🖨</span>
+                  Lancer l'impression
+                </button>
+                <button
+                  onClick={downloadPdf}
+                  disabled={printSelected.length === 0 || pdfGenerating}
+                  className="flex items-center gap-1.5 text-sm font-medium px-4 py-2 rounded-lg transition disabled:opacity-40"
+                  style={{ background: "#FFFFFF", color: "#23324D", border: "1px solid #C9D6E3" }}
+                >
+                  {pdfGenerating ? <span className="spin-icon" style={{ fontSize: 15 }}>⟳</span> : <span style={{ fontSize: 15 }}>⬇</span>}
+                  {pdfGenerating ? "Génération…" : "Télécharger en PDF"}
+                </button>
+              </div>
+              {pdfError && (
+                <p className="text-xs mt-2" style={{ color: "#B94A3F" }}>{pdfError}</p>
+              )}
+            </div>
+          )}
+
+          {/* Settings panel */}
+          {panelOpen && (
+            <div
+              className="mb-6 rounded-xl p-5 grid gap-6 sm:grid-cols-3"
+              style={{ background: "#FFFFFF", border: "1px solid #C9D6E3" }}
+            >
+              {/* Établissement actif */}
+              <div className="sm:col-span-3 pb-4" style={{ borderBottom: "1px solid #E3E8EF" }}>
+                <h3 className="font-display text-lg mb-2" style={{ color: "#23324D" }}>
+                  Établissement actif : {activeEstablishment.name || "sans nom"}
+                </h3>
+                <p className="text-xs mb-2" style={{ color: "#9AA7BD" }}>
+                  Ces informations apparaissent en haut et en bas de l'emploi du temps imprimé et téléchargé. La classe est reprise automatiquement depuis l'onglet actif.
+                </p>
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div>
+                    <label className="block text-xs mb-1" style={{ color: "#5B6B85" }}>Nom de l'établissement</label>
+                    <input
+                      value={activeEstablishment.name}
+                      onChange={(e) => updateActiveEstablishment("name", e.target.value)}
+                      placeholder="Ex : Collège Moderne d'Abomey-Calavi"
+                      className="w-full text-sm px-2 py-1.5 rounded-lg outline-none"
+                      style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs mb-1" style={{ color: "#5B6B85" }}>Année scolaire</label>
+                    <input
+                      value={activeEstablishment.year}
+                      onChange={(e) => updateActiveEstablishment("year", e.target.value)}
+                      placeholder="Ex : 2026-2027"
+                      className="w-full text-sm px-2 py-1.5 rounded-lg outline-none"
+                      style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs mb-1" style={{ color: "#5B6B85" }}>Signature en bas de page</label>
+                    <input
+                      value={activeEstablishment.footerLabel}
+                      onChange={(e) => updateActiveEstablishment("footerLabel", e.target.value)}
+                      placeholder="Ex : Le censorat"
+                      className="w-full text-sm px-2 py-1.5 rounded-lg outline-none"
+                      style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Subjects */}
+              <div>
+                <h3 className="font-display text-lg mb-2" style={{ color: "#23324D" }}>Matières</h3>
+                <div className="flex flex-col gap-1.5 mb-3">
+                  {subjects.map((s) => (
+                    <div key={s.id} className="flex items-center gap-2 text-sm">
+                      <span className="w-3.5 h-3.5 rounded-full flex-shrink-0" style={{ background: s.color }} />
+                      <span className="flex-1" style={{ color: "#23324D" }}>{s.name}</span>
+                      <button onClick={() => removeSubject(s.id)} style={{ color: "#B94A3F" }} aria-label={`Supprimer ${s.name}`}>
+                        <span style={{ fontSize: 13 }}>🗑</span>
+                      </button>
+                    </div>
+                  ))}
+                  {subjects.length === 0 && (
+                    <p className="text-xs" style={{ color: "#9AA7BD" }}>Aucune matière pour l'instant.</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 mb-2 flex-wrap">
+                  {SWATCHES.map((c) => (
+                    <button
+                      key={c}
+                      onClick={() => setNewSubjectColor(c)}
+                      className="w-5 h-5 rounded-full"
+                      style={{ background: c, boxShadow: newSubjectColor === c ? "0 0 0 2px #FFFFFF, 0 0 0 4px #23324D" : "none" }}
+                      aria-label={`Choisir la couleur ${c}`}
+                    />
+                  ))}
+                </div>
+                <div className="flex gap-1.5">
+                  <input
+                    value={newSubjectName}
+                    onChange={(e) => setNewSubjectName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") addSubject(); }}
+                    placeholder="Nom de la matière"
+                    className="flex-1 min-w-0 text-sm px-2 py-1.5 rounded-lg outline-none"
+                    style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                  />
+                  <button onClick={addSubject} className="p-1.5 rounded-lg flex-shrink-0" style={{ background: "#23324D", color: "#fff" }} aria-label="Ajouter la matière">
+                    <span style={{ fontSize: 14, fontWeight: 700 }}>+</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Time slots */}
+              <div>
+                <h3 className="font-display text-lg mb-2" style={{ color: "#23324D" }}>Créneaux d'une heure</h3>
+                <p className="text-xs mb-2" style={{ color: "#9AA7BD" }}>
+                  Le tableau propose déjà 7h–19h heure par heure. Ajoutez-en d'autres si besoin.
+                </p>
+                <div className="flex flex-col gap-1.5 mb-3 max-h-40 overflow-y-auto pr-1">
+                  {timeSlots.map((s) => (
+                    <div key={s.id} className="flex items-center gap-2 text-sm font-mono">
+                      <span className="flex-1" style={{ color: "#23324D" }}>{s.label}</span>
+                      <button onClick={() => removeSlot(s.id)} style={{ color: "#B94A3F" }} aria-label={`Supprimer ${s.label}`}>
+                        <span style={{ fontSize: 13 }}>🗑</span>
+                      </button>
+                    </div>
+                  ))}
+                  {timeSlots.length === 0 && (
+                    <p className="text-xs font-body" style={{ color: "#9AA7BD" }}>Aucun créneau pour l'instant.</p>
+                  )}
+                </div>
+                <div className="flex gap-1.5 items-center">
+                  <input
+                    value={newSlotStart}
+                    onChange={(e) => setNewSlotStart(e.target.value)}
+                    placeholder="19h"
+                    className="w-16 text-sm px-2 py-1.5 rounded-lg outline-none font-mono"
+                    style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                  />
+                  <span className="text-sm" style={{ color: "#5B6B85" }}>–</span>
+                  <input
+                    value={newSlotEnd}
+                    onChange={(e) => setNewSlotEnd(e.target.value)}
+                    placeholder="20h"
+                    className="w-16 text-sm px-2 py-1.5 rounded-lg outline-none font-mono"
+                    style={{ border: "1px solid #C9D6E3", color: "#23324D" }}
+                  />
+                  <button onClick={addSlot} className="p-1.5 rounded-lg flex-shrink-0" style={{ background: "#23324D", color: "#fff" }} aria-label="Ajouter le créneau">
+                    <span style={{ fontSize: 14, fontWeight: 700 }}>+</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Days */}
+              <div>
+                <h3 className="font-display text-lg mb-2" style={{ color: "#23324D" }}>Jours</h3>
+                <div className="flex flex-col gap-1.5">
+                  {days.map((d) => (
+                    <label key={d.id} className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: "#23324D" }}>
+                      <input type="checkbox" checked={d.active} onChange={() => toggleDay(d.id)} />
+                      {d.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Establishment tabs */}
+          <div className="flex flex-wrap items-center gap-1.5 mb-3 rounded-lg p-1.5" style={{ background: "#23324D" }}>
+            <span className="text-xs font-medium px-2 hidden sm:inline" style={{ color: "#9FB8E0" }}>Établissement</span>
+            {establishments.map((est) => (
+              <div
+                key={est.id}
+                onClick={() => selectEstablishment(est.id)}
+                className="group flex items-center gap-1.5 px-3 py-1.5 rounded-md cursor-pointer text-sm font-medium transition"
+                style={{
+                  background: est.id === activeEstablishmentId ? "#FFFFFF" : "transparent",
+                  color: est.id === activeEstablishmentId ? "#23324D" : "#C9D6E3",
+                }}
+              >
+                <span>{est.name || "Sans nom"}</span>
+                {establishments.length > 1 && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); removeEstablishment(est.id); }}
+                    className="opacity-0 group-hover:opacity-100 transition"
+                    style={{ color: est.id === activeEstablishmentId ? "#B94A3F" : "#C9D6E3" }}
+                    aria-label={`Supprimer ${est.name || "cet établissement"}`}
+                  >
+                    <span style={{ fontSize: 12, fontWeight: 700 }}>×</span>
+                  </button>
+                )}
+              </div>
+            ))}
+            <div className="flex items-center gap-1 ml-1">
+              <input
+                value={newEstablishmentName}
+                onChange={(e) => setNewEstablishmentName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addEstablishment(); }}
+                placeholder="Nouvel établissement"
+                className="text-sm px-2 py-1.5 rounded-md outline-none"
+                style={{ background: "#FFFFFF", color: "#23324D", width: 170 }}
+              />
+              <button onClick={addEstablishment} className="p-1.5 rounded-md" style={{ background: "#B94A3F", color: "#fff" }} aria-label="Ajouter un établissement">
+                <span style={{ fontSize: 14, fontWeight: 700 }}>+</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Class tabs */}
+          <div className="flex flex-wrap items-end gap-1.5 mb-0 relative z-10">
+            {establishmentClasses.map((c) => (
+              <div
+                key={c.id}
+                onClick={() => setActiveClassId(c.id)}
+                className="group flex items-center gap-1.5 px-4 py-2.5 cursor-pointer text-sm font-semibold transition"
+                style={{
+                  background: c.id === activeClassId ? "#FFFFFF" : "#E9EDF1",
+                  color: c.id === activeClassId ? "#23324D" : "#5B6B85",
+                  borderTop: c.id === activeClassId ? "2px solid #B94A3F" : "2px solid transparent",
+                  border: "1px solid #C9D6E3",
+                  borderBottom: c.id === activeClassId ? "1px solid #FFFFFF" : "1px solid #C9D6E3",
+                  borderTopLeftRadius: 8,
+                  borderTopRightRadius: 8,
+                  marginBottom: -1,
+                }}
+              >
+                <span>{c.name}</span>
+                {establishmentClasses.length > 1 && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); removeClass(c.id); }}
+                    className="opacity-0 group-hover:opacity-100 transition"
+                    style={{ color: "#B94A3F" }}
+                    aria-label={`Supprimer la classe ${c.name}`}
+                  >
+                    <span style={{ fontSize: 13, fontWeight: 700 }}>×</span>
+                  </button>
+                )}
+              </div>
+            ))}
+            <div className="flex items-center gap-1 pb-0.5 ml-1">
+              <input
+                value={newClassName}
+                onChange={(e) => setNewClassName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addClass(); }}
+                placeholder="Nouvelle classe (ex : 5ème B)"
+                className="text-sm px-2 py-2 rounded-lg outline-none"
+                style={{ border: "1px solid #C9D6E3", background: "#FFFFFF", color: "#23324D", width: 180 }}
+              />
+              <button onClick={addClass} className="p-2 rounded-lg" style={{ background: "#23324D", color: "#FFFFFF" }} aria-label="Ajouter une classe">
+                <span style={{ fontSize: 14, fontWeight: 700 }}>+</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Grid */}
+          <div
+            className="overflow-x-auto rounded-b-xl rounded-tr-xl"
+            style={{ border: "1px solid #C9D6E3", background: "#FFFFFF" }}
+          >
+            {!activeClass ? (
+              <p className="p-6 text-sm" style={{ color: "#5B6B85" }}>Ajoutez une classe pour commencer.</p>
+            ) : activeDays.length === 0 ? (
+              <p className="p-6 text-sm" style={{ color: "#5B6B85" }}>Activez au moins un jour dans les réglages.</p>
+            ) : timeSlots.length === 0 ? (
+              <p className="p-6 text-sm" style={{ color: "#5B6B85" }}>Ajoutez un créneau horaire dans les réglages.</p>
+            ) : (
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr>
+                    <th
+                      className="w-24 sm:w-28 p-3 text-left font-mono text-xs font-medium"
+                      style={{ color: "#5B6B85", borderBottom: "2px solid #B94A3F" }}
+                    >
+                      Horaire
+                    </th>
+                    {activeDays.map((d) => (
+                      <th
+                        key={d.id}
+                        className="p-3 text-center font-display text-lg font-normal"
+                        style={{ color: "#23324D", borderBottom: "2px solid #B94A3F", borderLeft: "1px solid #E3E8EF" }}
+                      >
+                        {d.name}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {timeSlots.map((slot, idx) => (
+                    <tr key={slot.id} style={{ borderTop: idx === 0 ? "none" : "1px solid #E3E8EF" }}>
+                      <td className="p-2 font-mono text-xs whitespace-nowrap" style={{ color: "#5B6B85" }}>
+                        {slot.label}
+                      </td>
+                      {activeDays.map((d) => {
+                        const cell = dayCellsMap[d.id][idx];
+                        if (cell.kind === "skip") return null;
+                        const subjId = cell.kind === "start" ? cell.subjectId : "";
+                        const duration = cell.kind === "start" ? cell.duration : 1;
+                        const subj = subjects.find((s) => s.id === subjId);
+                        const maxDur = Math.min(3, timeSlots.length - idx);
+                        const durationOptions = Array.from({ length: maxDur }, (_, i) => i + 1);
+                        return (
+                          <td
+                            key={d.id}
+                            rowSpan={duration}
+                            className="p-1.5 align-middle"
+                            style={{ borderLeft: "1px solid #E3E8EF" }}
+                          >
+                            <div className="flex flex-col gap-1">
+                              <select
+                                className="cell-select w-full text-sm rounded-lg px-2 py-2 font-medium cursor-pointer"
+                                style={{
+                                  background: subj ? subj.color + "CC" : "#FAFAF7",
+                                  color: subj ? "#23324D" : "#9AA7BD",
+                                  border: subj ? `1px solid ${subj.color}` : "1px dashed #C9D6E3",
+                                }}
+                                value={subjId}
+                                onChange={(e) => setCellBlock(d.id, slot.id, e.target.value, duration)}
+                              >
+                                <option value="">—</option>
+                                {subjects.map((s) => (
+                                  <option key={s.id} value={s.id}>{s.name}</option>
+                                ))}
+                              </select>
+                              {subj && (
+                                <select
+                                  className="cell-select w-full text-xs rounded-lg px-2 py-1 font-mono cursor-pointer"
+                                  style={{ border: "1px solid #C9D6E3", color: "#5B6B85", background: "#FFFFFF" }}
+                                  value={duration}
+                                  onChange={(e) => setCellBlock(d.id, slot.id, subj.id, parseInt(e.target.value, 10))}
+                                >
+                                  {durationOptions.map((n) => (
+                                    <option key={n} value={n}>{n}h ({blockLabel(timeSlots, idx, n)})</option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <p className="text-xs mt-4" style={{ color: "#9AA7BD" }}>
+            Les données de cet établissement sont sauvegardées automatiquement sur cet appareil.
+          </p>
+          <p className="text-xs mt-1" style={{ color: "#9AA7BD" }}>
+            Créé par Samson ALOHOU
+          </p>
+        </div>
+      </div>
+
+      {/* Print-only content */}
+      <div className="print-only">
+        {printSelected.map((id) => {
+          const cls = classes.find((c) => c.id === id);
+          if (!cls) return null;
+          const est = establishments.find((e) => e.id === cls.estId) || { name: "", year: "", footerLabel: "Le censorat" };
+          return (
+            <div className="print-page" id={`print-page-${id}`} key={id}>
+              {renderPrintCopy(cls, est)}
+              <div className="print-cut-line"><span>✂ découper ici</span></div>
+              {renderPrintCopy(cls, est)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+const rootEl = document.getElementById('root');
+ReactDOM.createRoot(rootEl).render(<TimetableApp />);
+
+</script>
+
+<script>
+  (function () {
+    var fallback = document.getElementById('loading-fallback');
+    function showError(title, detail) {
+      if (!fallback) return;
+      fallback.innerHTML =
+        "<div style='color:#B94A3F; text-align:left; max-width:92vw; font-family:sans-serif;'>" +
+        "<strong>" + title + "</strong><br/>" +
+        "<div style='font-family:monospace; font-size:11px; white-space:pre-wrap; margin-top:8px; background:#F7F7F2; padding:8px; border-radius:6px; max-height:50vh; overflow:auto;'>" +
+        String(detail).replace(/</g, "&lt;") +
+        "</div></div>";
+    }
+    try {
+      if (typeof Babel === "undefined") {
+        showError("Babel ne s'est pas chargé", "Le script https://unpkg.com/@babel/standalone n'a pas pu se charger (connexion trop lente ou bloquée).");
+        return;
+      }
+      var code = document.getElementById('app-source').textContent;
+      var result = Babel.transform(code, { presets: [["react", { runtime: "classic" }]] });
+      var output = result.code;
+      if (/(^|\n)\s*(import|export)\s/.test(output)) {
+        showError("Le code transformé contient encore import/export :", output.slice(0, 800));
+        return;
+      }
+      var script = document.createElement("script");
+      script.textContent = output;
+      document.body.appendChild(script);
+    } catch (err) {
+      showError("Erreur de transformation ou d'exécution :", (err && err.message) ? err.message : String(err));
+    }
+  })();
+
+  setTimeout(function () {
+    var el = document.getElementById('loading-fallback');
+    if (el && el.textContent.indexOf("Chargement") !== -1) {
+      el.innerHTML = "Le chargement prend plus de temps que prévu.<br/>Vérifiez votre connexion Internet (essayez en Wi-Fi) puis rafraîchissez la page.";
+    }
+  }, 9000);
+</script>
+</body>
+</html>
